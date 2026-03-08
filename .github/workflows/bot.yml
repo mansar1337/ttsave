@@ -1,0 +1,27 @@
+name: TikTok Bot Runner
+
+on:
+  workflow_dispatch:  # Ручной запуск
+  schedule:
+    - cron: '*/5 * * * *'  # Каждые 5 минут
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+    
+    - name: Run bot
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      run: |
+        timeout 300 python main.py  # Работает 5 минут
