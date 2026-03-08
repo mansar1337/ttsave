@@ -300,10 +300,12 @@ async def download_and_send(
 
     tmpdir = tempfile.mkdtemp(prefix="tiktok_")
     output_path: Optional[Path] = None
-    last_edit_time: float = 0.0  # throttle edits to ~2 per second
+    last_edit_time: float = 0.0
+
+    # ✅ Capture the running loop HERE, in the async context, before any threads start.
+    loop = asyncio.get_running_loop()
 
     async def safe_edit(text: str) -> None:
-        """Edit status message, ignoring 'message not modified' errors."""
         nonlocal last_edit_time
         now = time.monotonic()
         if now - last_edit_time < 0.5:
@@ -317,10 +319,10 @@ async def download_and_send(
                 reply_markup=cancel_keyboard(),
             )
         except Exception:
-            pass  # Message already deleted or unchanged — ignore
+            pass
 
     def progress_hook(d: dict) -> None:
-        """Called by yt-dlp from a thread; schedule coroutine safely."""
+        """Called by yt-dlp from an executor thread — use the pre-captured loop."""
         if d.get("status") == "downloading":
             if is_premium:
                 downloaded = d.get("downloaded_bytes", 0)
@@ -340,12 +342,12 @@ async def download_and_send(
                 percent_str = d.get("_percent_str", "").strip()
                 text = f"⬇️ Downloading… {percent_str}"
 
-            asyncio.run_coroutine_threadsafe(safe_edit(text), asyncio.get_event_loop())
+            # ✅ Use the pre-captured loop, not get_event_loop() (which fails in threads)
+            asyncio.run_coroutine_threadsafe(safe_edit(text), loop)
 
     try:
         await safe_edit("🔍 Fetching video info…")
 
-        # Build yt-dlp options
         fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
         ydl_opts: dict = {
             "format": fmt,
@@ -358,17 +360,13 @@ async def download_and_send(
         }
 
         if audio == "silent":
-            # Download video only, no audio
-            ydl_opts["format"] = (
-                "bestvideo[height<=720][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
-            )
             if quality == "low":
                 ydl_opts["format"] = "bestvideo[height<=360][ext=mp4]/bestvideo"
             elif quality == "medium":
                 ydl_opts["format"] = "bestvideo[height<=720][ext=mp4]/bestvideo"
+            else:
+                ydl_opts["format"] = "bestvideo[height<=720][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
 
-        # Run yt-dlp in a thread pool to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
         info: dict = await loop.run_in_executor(
             None, lambda: _run_ydl(ydl_opts, url)
         )
@@ -377,7 +375,6 @@ async def download_and_send(
             await safe_edit("❌ Could not retrieve video info.")
             return
 
-        # Find downloaded file
         video_id = info.get("id", "")
         candidates = list(Path(tmpdir).glob(f"{video_id}.*"))
         if not candidates:
@@ -389,7 +386,6 @@ async def download_and_send(
         output_path = candidates[0]
         file_size = output_path.stat().st_size
 
-        # Telegram limit is 50 MB for bots
         if file_size > 50 * 1024 * 1024:
             await safe_edit(
                 "❌ File is too large to send via Telegram (>50 MB).\n"
@@ -402,9 +398,6 @@ async def download_and_send(
         title = info.get("title", "TikTok video")
         caption = f"🎬 {title[:900]}" if title else "🎬 TikTok video"
 
-        async with bot.session:
-            pass  # Keep session alive (no-op; aiogram manages session internally)
-
         with output_path.open("rb") as video_file:
             await bot.send_video(
                 chat_id=chat_id,
@@ -413,7 +406,6 @@ async def download_and_send(
                 supports_streaming=True,
             )
 
-        # Remove the status message after successful upload
         try:
             await bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
         except Exception:
@@ -423,13 +415,12 @@ async def download_and_send(
 
     except asyncio.CancelledError:
         logger.info("Download task cancelled for user %d.", chat_id)
-        # The cancel button handler already edited the message
         raise
 
     except yt_dlp.utils.DownloadError as exc:
         logger.warning("yt-dlp error for user %d: %s", chat_id, exc)
         msg = str(exc)
-        if "Private" in msg or "private" in msg:
+        if "private" in msg.lower():
             await safe_edit("❌ This video is private and cannot be downloaded.")
         elif "removed" in msg.lower():
             await safe_edit("❌ This video has been removed.")
@@ -441,10 +432,8 @@ async def download_and_send(
         await safe_edit(f"❌ Unexpected error: {exc}")
 
     finally:
-        # Clean up temp files regardless of outcome
         _cleanup(tmpdir)
         active_tasks.pop(chat_id, None)
-
 
 def _run_ydl(opts: dict, url: str) -> Optional[dict]:
     """Synchronous yt-dlp extraction; runs in executor thread."""
