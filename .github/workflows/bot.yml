@@ -1,14 +1,13 @@
 name: TikTok Bot Runner
 
 on:
-  workflow_dispatch:  # ← только ручной запуск (чтобы бот работал 6 часов без перезапусков)
+  workflow_dispatch:   # только ручной запуск (можно потом добавить schedule)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360          # максимум 6 часов (GitHub сам убьёт после этого)
+    timeout-minutes: 360          # максимум 6 часов
     
-    # Защита от одновременного запуска нескольких ботов
     concurrency:
       group: tiktok-bot-runner
       cancel-in-progress: false
@@ -30,4 +29,4 @@ jobs:
       env:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       run: |
-        python main.py          # ← без timeout! работает до 6 часов
+        python main.py          # ← БЕЗ timeout! Работает до 6 часов
