@@ -1,15 +1,20 @@
+name: TikTok Bot Runner
+
+on:
+  workflow_dispatch:  # ← только ручной запуск (чтобы бот работал 6 часов без перезапусков)
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360          # явно ставим максимум (хотя по умолчанию уже 360)
+    timeout-minutes: 360          # максимум 6 часов (GitHub сам убьёт после этого)
     
-    # ← Добавь concurrency, чтобы не запускалось 100500 ботов одновременно
+    # Защита от одновременного запуска нескольких ботов
     concurrency:
       group: tiktok-bot-runner
-      cancel-in-progress: false   # false = старый бот продолжает работать до 6 часов
+      cancel-in-progress: false
 
     steps:
-    - uses: actions/checkout@v4   # обнови до v4, v3 уже устарел
+    - uses: actions/checkout@v4
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -25,4 +30,4 @@ jobs:
       env:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       run: |
-        python main.py                # ← УБРАЛИ timeout 300!
+        python main.py          # ← без timeout! работает до 6 часов
