@@ -176,9 +176,10 @@ def update_stats(success: bool, user_id: int):
     
     if success:
         bot_stats['successful_downloads'] += 1
-        bot_stats['last_download'] = datetime.now()
     else:
         bot_stats['failed_downloads'] += 1
+    
+    bot_stats['last_download'] = datetime.now()
     
     # Добавляем пользователя в статистику
     bot_stats['users'].add(user_id)
@@ -742,7 +743,7 @@ async def button_stats(message: Message):
 ✅ Успешных: {bot_stats['successful_downloads']}
 ❌ Неудачных: {bot_stats['failed_downloads']}
 📈 Успешность: {success_rate:.1f}%
-👥 Пользователей: {bot_stats['users_count']}
+👥 Пользователей: {len(bot_stats.get('users', set()))}
 ⏰ Время работы: {str(uptime).split('.')[0]}
 🕐 Последнее скачивание: {bot_stats['last_download'].strftime('%H:%M %d.%m.%Y') if bot_stats['last_download'] else 'Нет'}
         """.strip()
@@ -827,7 +828,7 @@ async def admin_callback(callback: CallbackQuery):
 ✅ Успешных: {bot_stats['successful_downloads']}
 ❌ Неудачных: {bot_stats['failed_downloads']}
 📈 Успешность: {success_rate:.1f}%
-👥 Пользователей: {bot_stats['users_count']}
+👥 Пользователей: {len(bot_stats.get('users', set()))}
 ⏰ Время работы: {str(uptime).split('.')[0]}
 🕐 Последнее скачивание: {bot_stats['last_download'].strftime('%H:%M %d.%m.%Y') if bot_stats['last_download'] else 'Нет'}
         """
@@ -1030,6 +1031,15 @@ async def cmd_start(message: Message):
         is_premium = is_premium_user(message.from_user.id)
         is_admin_user = is_admin(message.from_user.id)
         
+        # Проверяем есть ли параметр языка в команде
+        if message.text and len(message.text.split()) > 1:
+            lang_param = message.text.split()[1].lower()
+            if lang_param in ['ru', 'en']:
+                # Сохраняем выбор языка в глобальную переменную
+                globals()['LANGUAGE'] = lang_param
+                await message.answer(f"🌐 **Язык изменен на {'Русский' if lang_param == 'ru' else 'English'}**", parse_mode=ParseMode.MARKDOWN)
+                return
+        
         if LANGUAGE == 'ru':
             welcome_text = f"""
 {get_text('welcome')} {'👑' if is_premium else ''} {'🔧' if is_admin_user else ''}
@@ -1052,6 +1062,10 @@ async def cmd_start(message: Message):
 `vt.tiktok.com/...`
 `vm.tiktok.com/...`
 
+💡 **Язык:** Русский 🇷🇺
+
+🌐 **Изменить язык:** `/start en` (English)
+
 {'👑 **Премиум статус активирован!**' if is_premium else ''}
 {'🔧 **Админ права активированы!**' if is_admin_user else ''}
 {'🔓 **Хотите больше функций? Отправьте `PREMIUM2024`**' if not is_premium and not is_admin_user else ''}
@@ -1070,7 +1084,7 @@ async def cmd_start(message: Message):
 {get_text('start_help')}
 
 {get_text('features')}
-• 📥 Download videos and photos up to 50MB
+• 📥 Download videos and photos
 • 🖼️ Save images and photos
 • ⚡ Fast link processing
 • 📊 Beautiful progress bar
@@ -1082,6 +1096,10 @@ async def cmd_start(message: Message):
 `vt.tiktok.com/...`
 `vm.tiktok.com/...`
 
+💡 **Language:** English 🇺🇸
+
+🌐 **Change language:** `/start ru` (Русский)
+
 {'👑 **Premium status activated!**' if is_premium else ''}
 {'🔧 **Admin rights activated!**' if is_admin_user else ''}
 {'🔓 **Want more features? Send `PREMIUM2024`**' if not is_premium and not is_admin_user else ''}
@@ -1091,19 +1109,25 @@ async def cmd_start(message: Message):
 🎮 **Use the buttons below for navigation!**
             """.strip()
         
-        await message.answer(welcome_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+        try:
+            await message.answer(welcome_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            print(f"Error in cmd_start: {e}")
+            simple_text = f"Привет, {message.from_user.first_name}! Отправьте ссылку на TikTok видео для скачивания."
+            await message.answer(simple_text, reply_markup=create_main_keyboard(message.from_user.id))
     except Exception as e:
-        print(f"Error in cmd_start: {e}")
-        # Отправляем упрощенное сообщение без форматирования
-        simple_text = f"Привет, {message.from_user.first_name}! Отправьте ссылку на TikTok видео для скачивания."
-        await message.answer(simple_text, reply_markup=create_main_keyboard(message.from_user.id))
+        print(f"Critical error in cmd_start: {e}")
+        await message.answer(
+            f"Привет, {message.from_user.first_name}! Отправьте ссылку на TikTok.",
+            reply_markup=create_main_keyboard(message.from_user.id)
+        )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     try:
         help_text = """
-ℹ️ **Подощь - TikTok Downloader Bot**
-━━━━━━━━━━━━━━━━━━
+ℹ️ **Помощь - TikTok Downloader Bot**
+━━━━━━━━━━━━━━━━
 
 🔗 **Как использовать:**
 1. Нажмите "📥 Скачать видео" или отправьте ссылку
@@ -1148,18 +1172,21 @@ async def cmd_help(message: Message):
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     try:
-        user_id = message.from_user.id
-        username = message.from_user.username or "Нет"
-        
-        id_text = f"""
-🆔 **Ваша информация**
-━━━━━━━━━━━━━━━━━━
-👤 ID: `{user_id}`
-🏷️ Username: @{username}
-📝 Имя: {message.from_user.full_name}
+        user_id_text = f"""
+🆔 **Ваш ID:**
+━━━━━━━━━━━━━━━━
+`{message.from_user.id}`
+━━━━━━━━━━━━━━━━
+
+💡 **Для чего нужен ID:**
+• 🚫 Активация премиум (если нужно)
+• 🔐 Доступ к админ-панели
+• 📊 Просмотр статистики
+
+🎮 **Используйте кнопки ниже!**
         """.strip()
         
-        await message.answer(id_text, reply_markup=create_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        await message.answer(user_id_text, reply_markup=create_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         print(f"Error in cmd_id: {e}")
         simple_id = f"Ваш ID: {message.from_user.id}"
@@ -1172,6 +1199,7 @@ async def handle_text_message(message: Message):
         return
     
     text = message.text
+    is_premium_user_status = is_premium_user(message.from_user.id)  # Определяем статус пользователя
     
     # Проверяем секретный код премиум
     if text == PREMIUM_SECRET_CODE:
@@ -1184,7 +1212,7 @@ async def handle_text_message(message: Message):
         # Если это не ссылка, показываем подсказку
         if not any(button.text in text for button in create_main_keyboard(message.from_user.id).keyboard[0] + 
                   create_main_keyboard(message.from_user.id).keyboard[1] +
-                  (create_main_keyboard(message.from_user.id).keyboard[2] if is_premium_user(message.from_user.id) else [])):
+                  (create_main_keyboard(message.from_user.id).keyboard[2] if is_premium_user_status else [])):
             await message.answer(
                 "🔍 **Не найдено TikTok ссылки**\n\n"
                 "Отправьте ссылку на TikTok видео или используйте кнопки ниже:",
@@ -1200,7 +1228,7 @@ async def handle_text_message(message: Message):
     print(f"Найдена TikTok ссылка: {url}")
     
     # Создаем начальное сообщение с прогрессом
-    is_premium = is_premium_user(message.from_user.id)
+    is_premium = is_premium_user_status
     progress_text = f"""
 📥 **Скачивание видео** {'👑' if is_premium else ''}
 ━━━━━━━━━━━━━━━━━━
@@ -1247,7 +1275,7 @@ async def handle_text_message(message: Message):
                 return
             
             # Показываем финальный прогресс
-            is_premium_user = is_premium_user(message.from_user.id)
+            is_premium_user_final = is_premium_user_status
             is_admin_user = is_admin(message.from_user.id)
             
             final_progress = f"""
@@ -1258,7 +1286,7 @@ async def handle_text_message(message: Message):
 ⚡ Скорость: Готово!
 📦 Скачано: {file_size/1024/1024:.1f} MB
 📏 Всего: {file_size/1024/1024:.1f} MB
-✅ Скачивание завершено{' 👑' if is_premium_user else ''}{' 🔧' if is_admin_user else ''}!
+✅ Скачивание завершено{' 👑' if is_premium_user_final else ''}{' 🔧' if is_admin_user else ''}!
             """.strip()
             
             await processing_msg.edit_text(final_progress, parse_mode=ParseMode.MARKDOWN)
@@ -1273,7 +1301,7 @@ async def handle_text_message(message: Message):
                 await bot.send_photo(
                     chat_id=message.chat.id,
                     photo=types.FSInputFile(file_path),
-                    caption=f"🖼️ **Вот ваше изображение из TikTok!**{' 👑' if is_premium_user else ''}{' 🔧' if is_admin_user else ''}\n\n"
+                    caption=f"🖼️ **Вот ваше изображение из TikTok!**{' 👑' if is_premium_user_final else ''}{' 🔧' if is_admin_user else ''}\n\n"
                            f"🎉 Скачано успешно! Используйте кнопки для навигации.",
                     reply_markup=create_main_keyboard(message.from_user.id),
                     parse_mode=ParseMode.MARKDOWN
@@ -1282,7 +1310,7 @@ async def handle_text_message(message: Message):
                 await bot.send_video(
                     chat_id=message.chat.id,
                     video=types.FSInputFile(file_path),
-                    caption=f"🎬 **Вот ваше видео из TikTok!**{' 👑' if is_premium_user else ''}{' 🔧' if is_admin_user else ''}\n\n"
+                    caption=f"🎬 **Вот ваше видео из TikTok!**{' 👑' if is_premium_user_final else ''}{' 🔧' if is_admin_user else ''}\n\n"
                            f"🎉 Скачано успешно! Используйте кнопки для навигации.",
                     reply_markup=create_main_keyboard(message.from_user.id),
                     parse_mode=ParseMode.MARKDOWN
@@ -1336,23 +1364,40 @@ async def handle_other_messages(message: Message):
 
 async def main():
     print("🚀 TikTok Bot запускается...")
+    global github_actions_start_time
     
-    # Оптимизация для GitHub Actions
+    # Оптимизация для GitHub Actions (только в GitHub Actions)
     if GITHUB_ACTIONS_MODE:
         print("🔄 Режим GitHub Actions активирован")
         print(f"⏰ Максимальное время работы: {MAX_RUNTIME} секунд")
+        github_actions_start_time = time.time()
         
         # Запускаем таймер для автоматического завершения
         asyncio.create_task(github_actions_timer())
     
     await dp.start_polling(bot)
+    
+    try:
+        if GITHUB_ACTIONS_MODE:
+            # В GitHub Actions работаем по таймеру
+            while time.time() - github_actions_start_time < MAX_RUNTIME:
+                await asyncio.sleep(1)
+        else:
+            # Локально работаем бесконечно
+            while True:
+                await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print("🛑 Бот остановлен")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        os._exit(1)
 
 async def github_actions_timer():
     """Таймер для автоматического завершения в GitHub Actions с логированием"""
-    start_time = time.time()
+    global github_actions_start_time
     
-    while time.time() - start_time < MAX_RUNTIME:
-        elapsed = int(time.time() - start_time)
+    while time.time() - github_actions_start_time < MAX_RUNTIME:
+        elapsed = int(time.time() - github_actions_start_time)
         hours = elapsed // 3600
         minutes = (elapsed % 3600) // 60
         seconds = elapsed % 60
