@@ -1,490 +1,1287 @@
-"""
-TikTok Downloader Telegram Bot
-Built with aiogram 3.x, yt-dlp, asyncio
-Supports premium users, quality selection, real-time progress, and cancellation.
-"""
-
-import asyncio
-import json
-import logging
 import os
 import re
+import asyncio
 import tempfile
 import time
+import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message, ContentType, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import yt_dlp
+from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]  # Must be set via environment variable
-PREMIUM_FILE = Path("premium_users.json")
-TIKTOK_RE = re.compile(r"https?://(?:www\.|vm\.)?tiktok\.com/\S+", re.IGNORECASE)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 6309839081
 
-# Quality presets (yt-dlp format strings)
-QUALITY_FORMATS = {
-    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-    "medium": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-    "low": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found in environment variables")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Оптимизация для GitHub Actions
+GITHUB_ACTIONS_MODE = os.getenv("GITHUB_ACTIONS") == "true"
+MAX_RUNTIME = 280  # Максимальное время работы в GitHub Actions (сек)
+
+# Премиум настройки
+PREMIUM_SECRET_CODE = "PREMIUM2024"  # Секретный код для активации
+premium_users = set()  # Множество премиум пользователей
+
+# Языковые настройки
+LANGUAGE = os.getenv("BOT_LANGUAGE", "ru")  # ru/en по умолчанию
+AUTHOR_CHANNEL = "@project_eliminator"vfr
+
+# Хранилище статистики
+bot_stats = {
+    'total_downloads': 0,
+    'successful_downloads': 0,
+    'failed_downloads': 0,
+    'users_count': 0,
+    'premium_users': 0,
+    'start_time': datetime.now(),
+    'last_download': None
 }
 
-# ---------------------------------------------------------------------------
-# Premium storage (simple JSON)
-# ---------------------------------------------------------------------------
+# Список заблокированных пользователей
+blocked_users = set()
 
-def load_premium() -> set[int]:
-    """Load premium user IDs from JSON file."""
-    if PREMIUM_FILE.exists():
+# Временное хранилище для прогресса
+download_progress = {}
+
+# ThreadPoolExecutor для асинхронного скачивания
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Тексты на разных языках
+TEXTS = {
+    'ru': {
+        'welcome': "🎉 **Добро пожаловать в TikTok Downloader Bot!**",
+        'help_text': "ℹ️ **Помощь - TikTok Downloader Bot**",
+        'start_help': "Я помогу тебе скачивать видео и изображения из TikTok бесплатно и без watermark!",
+        'features': "🚀 **Что я умею:**",
+        'download_video': "📥 Скачать видео",
+        'statistics': "📊 Статистика",
+        'help': "ℹ️ Помощь",
+        'my_id': "🆔 Мой ID",
+        'premium': "👑 Премиум",
+        'premium_settings': "⚙️ Премиум настройки",
+        'cancel_download': "❌ Отменить скачивание",
+        'downloading': "📥 **Скачивание видео**",
+        'searching': "🔍 Поиск видео...",
+        'completed': "✅ Скачивание завершено!",
+        'error': "❌ Ошибка скачивания",
+        'too_big': "❌ **Ошибка размера файла**",
+        'channel': f"📢 **Канал автора:** {AUTHOR_CHANNEL}",
+        'premium_activated': "🎉 **Премиум активирован!**",
+        'premium_benefits': "🎉 Ваши преимущества:",
+        'premium_code': "🔓 **Получите премиум доступ:**",
+        'secret_code': "Отправьте секретный код в сообщении:\n\n`PREMIUM2024`",
+        'premium_hint': "🤫 **Код известен только избранным...**"
+    },
+    'en': {
+        'welcome': "🎉 **Welcome to TikTok Downloader Bot!**",
+        'help_text': "ℹ️ **Help - TikTok Downloader Bot**",
+        'start_help': "I help you download TikTok videos and images for free and without watermark!",
+        'features': "🚀 **What I can do:**",
+        'download_video': "📥 Download Video",
+        'statistics': "📊 Statistics",
+        'help': "ℹ️ Help",
+        'my_id': "🆔 My ID",
+        'premium': "👑 Premium",
+        'premium_settings': "⚙️ Premium Settings",
+        'cancel_download': "❌ Cancel Download",
+        'downloading': "📥 **Downloading Video**",
+        'searching': "🔍 Searching for video...",
+        'completed': "✅ Download completed!",
+        'error': "❌ Download error",
+        'too_big': "❌ **File size error**",
+        'channel': f"📢 **Author's Channel:** {AUTHOR_CHANNEL}",
+        'premium_activated': "🎉 **Premium Activated!**",
+        'premium_benefits': "🎉 Your benefits:",
+        'premium_code': "🔓 **Get Premium Access:**",
+        'secret_code': "Send the secret code in a message:\n\n`PREMIUM2024`",
+        'premium_hint': "🤫 **Code known only to the chosen ones...**"
+    }
+}
+
+def get_text(key: str) -> str:
+    """Получить текст на текущем языке"""
+    return TEXTS.get(LANGUAGE, TEXTS['ru']).get(key, key)
+
+# Хранилище активных скачиваний для отмены
+active_downloads = {}
+
+# Хранилище последних сообщений для избежания дублирования
+last_messages = {}
+
+# Функция отмены скачивания
+def cancel_download(user_id: int) -> bool:
+    if user_id in download_progress and download_progress[user_id].get('active', False):
+        download_progress[user_id]['active'] = False
+        download_progress[user_id]['status_text'] = "❌ Скачивание отменено"
+        if user_id in active_downloads:
+            del active_downloads[user_id]
+        return True
+    return False
+
+# Функция проверки премиум статуса
+def is_premium_user(user_id: int) -> bool:
+    return user_id in premium_users
+
+# Функция активации премиум
+def activate_premium(user_id: int) -> bool:
+    if user_id not in premium_users:
+        premium_users.add(user_id)
+        bot_stats['premium_users'] = len(premium_users)
+        return True
+    return False
+
+# Функция проверки админа
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+# Функция проверки заблокированного пользователя
+def is_user_blocked(user_id: int) -> bool:
+    return user_id in blocked_users
+
+# Функция обновления статистики
+def update_stats(success: bool, user_id: int):
+    bot_stats['total_downloads'] += 1
+    if success:
+        bot_stats['successful_downloads'] += 1
+        bot_stats['last_download'] = datetime.now()
+    else:
+        bot_stats['failed_downloads'] += 1
+    
+    # Обновляем счетчик пользователей
+    if user_id not in bot_stats.get('users', set()):
+        bot_stats['users_count'] += 1
+        bot_stats.setdefault('users', set()).add(user_id)
+
+# Функция создания прогресс-бара
+def create_progress_bar(current: int, total: int, length: int = 20) -> str:
+    if total == 0:
+        return "█" * length
+    
+    filled = int((current / total) * length)
+    bar = "█" * filled + "░" * (length - filled)
+    percentage = min(100, int((current / total) * 100))
+    return f"{bar} {percentage}%"
+
+# Функция создания основной клавиатуры
+def create_main_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
+    is_premium = is_premium_user(user_id) if user_id else False
+    
+    if is_premium:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [
+                    KeyboardButton(text=get_text('download_video')),
+                    KeyboardButton(text=get_text('statistics'))
+                ],
+                [
+                    KeyboardButton(text=get_text('premium_settings')),
+                    KeyboardButton(text=get_text('help'))
+                ],
+                [
+                    KeyboardButton(text=get_text('my_id')),
+                    KeyboardButton(text=get_text('premium'))
+                ],
+                [
+                    KeyboardButton(text=get_text('cancel_download'))
+                ]
+            ],
+            resize_keyboard=True,
+            input_field_placeholder="Отправьте ссылку на TikTok..." if LANGUAGE == 'ru' else "Send TikTok link..."
+        )
+    else:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [
+                    KeyboardButton(text=get_text('download_video')),
+                    KeyboardButton(text=get_text('statistics'))
+                ],
+                [
+                    KeyboardButton(text=get_text('help')),
+                    KeyboardButton(text=get_text('my_id'))
+                ],
+                [
+                    KeyboardButton(text=get_text('cancel_download'))
+                ]
+            ],
+            resize_keyboard=True,
+            input_field_placeholder="Отправьте ссылку на TikTok..." if LANGUAGE == 'ru' else "Send TikTok link..."
+        )
+    return keyboard
+
+# Функция создания админ клавиатуры
+def create_admin_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
+        InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🚫 Заблокировать", callback_data="admin_block"),
+        InlineKeyboardButton(text="✅ Разблокировать", callback_data="admin_unblock")
+    )
+    builder.row(
+        InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"),
+        InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin_settings")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔄 Перезагрузить", callback_data="admin_restart")
+    )
+    return builder.as_markup()
+
+# Функция создания кнопок навигации
+def create_navigation_keyboard(back_button: bool = True, admin_panel: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    
+    if admin_panel:
+        builder.row(InlineKeyboardButton(text="🔐 Админ панель", callback_data="admin_back"))
+    
+    if back_button:
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main"))
+    
+    return builder.as_markup()
+
+TIKTOK_REGEX = re.compile(
+    r'(https?://)?(www\.)?(tiktok\.com/@[^/]+/video/\d+|vt\.tiktok\.com/[A-Za-z0-9]+|vm\.tiktok\.com/[A-Za-z0-9]+|tiktok\.com/t/[A-Za-z0-9]+|www\.tiktok\.com/@[^/]+/video/\d+)'
+)
+
+class TikTokDownloader:
+    def __init__(self, user_id: int = None):
+        self.user_id = user_id
+        self.is_premium = is_premium_user(user_id) if user_id else False
+        
+        # Базовые настройки
+        self.ydl_opts = {
+            'format': 'best[height<=1080]/best/worst',  # Более гибкий формат
+            'outtmpl': os.path.join(tempfile.gettempdir(), 'tiktok_%(id)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'ignoreerrors': True,  # Игнорировать ошибки формата
+            'no_check_certificate': True,  # Отключить проверку сертификатов
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'progress_hooks': [self.progress_hook],  # Добавляем хук для прогресса
+        }
+        
+        # Премиум настройки
+        if self.is_premium:
+            self.ydl_opts.update({
+                'format': 'best[height<=2160]/best/worst',  # 4K для премиум
+                'noplaylist': False,  # Поддержка плейлистов
+                'writesubtitles': True,  # Субтитры
+                'writeautomaticsub': True,  # Авто-субтитры
+                'embedsubtitles': True,  # Встроенные субтитры
+            })
+    
+    def progress_hook(self, d):
+        """Хук для отслеживания прогресса скачивания"""
+        if d['status'] == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            speed = d.get('speed', 0)
+            
+            # Обновляем прогресс для конкретного пользователя
+            if self.user_id and self.user_id in download_progress:
+                progress_data = {
+                    'downloaded': downloaded,
+                    'total': total,
+                    'speed': speed,
+                    'percentage': (downloaded / total * 100) if total > 0 else 0
+                }
+                download_progress[self.user_id].update(progress_data)
+                print(f"Progress updated for user {self.user_id}: {progress_data['percentage']:.1f}%")
+    
+    def _download_sync(self, url: str, user_id: int) -> Optional[str]:
+        """Синхронное скачивание для выполнения в ThreadPool"""
         try:
-            return set(json.loads(PREMIUM_FILE.read_text()))
-        except Exception:
-            return set()
-    return set()
+            # Проверяем не отменено ли скачивание перед началом
+            if user_id not in active_downloads:
+                print(f"Download cancelled before start for user {user_id}")
+                return None
+                
+            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                
+                # Проверяем не отменено ли скачивание после извлечения информации
+                if user_id not in active_downloads:
+                    print(f"Download cancelled after info extraction for user {user_id}")
+                    return None
+                
+                if info:
+                    filename = ydl.prepare_filename(info)
+                    if os.path.exists(filename):
+                        return filename
+                    else:
+                        # Ищем файл с разными расширениями
+                        for ext in ['mp4', 'jpg', 'webp', 'png', 'srt', 'vtt']:
+                            test_file = os.path.join(tempfile.gettempdir(), f"tiktok_{info.get('id', 'unknown')}.{ext}")
+                            if os.path.exists(test_file):
+                                return test_file
+                                
+                        # Если файл не найден по шаблону, ищем в временной директории
+                        temp_dir = tempfile.gettempdir()
+                        for file in os.listdir(temp_dir):
+                            if file.startswith('tiktok_') and info.get('id') in file:
+                                full_path = os.path.join(temp_dir, file)
+                                if os.path.isfile(full_path):
+                                    return full_path
+        except Exception as e:
+            print(f"Error in _download_sync: {e}")
+            return None
+        
+        return None
+    
+    async def download_tiktok(self, url: str, user_id: int, message: Message) -> Optional[str]:
+        try:
+            # Инициализируем прогресс для пользователя
+            download_progress[user_id] = {
+                'active': True,
+                'downloaded': 0,
+                'total': 0,
+                'speed': 0,
+                'percentage': 0,
+                'message': message,
+                'status_text': get_text('searching'),
+                'start_time': time.time()
+            }
+            
+            # Добавляем в активные скачивания
+            active_downloads[user_id] = True
+            
+            print(f"Starting async download for user {user_id}")
+            
+            # Запускаем задачу обновления прогресса с частотой для премиум
+            update_interval = 0.3 if self.is_premium else 1.0  # 300мс для премиум, 1с для обычных
+            progress_task = asyncio.create_task(self.update_progress_message(user_id, update_interval))
+            print(f"Progress task started for user {user_id}")
+            
+            # Выполняем скачивание в отдельном потоке, чтобы не блокировать event loop
+            loop = asyncio.get_event_loop()
+            file_path = await loop.run_in_executor(executor, self._download_sync, url, user_id)
+            
+            # Проверяем не отменено ли скачивание
+            if user_id not in active_downloads:
+                print(f"Download cancelled for user {user_id}")
+                return None
+            
+            # Завершаем прогресс
+            download_progress[user_id]['active'] = False
+            download_progress[user_id]['status_text'] = get_text('completed')
+            
+            # Отменяем задачу прогресса
+            progress_task.cancel()
+            print(f"Progress task cancelled for user {user_id}")
+            
+            # Удаляем из активных скачиваний
+            if user_id in active_downloads:
+                del active_downloads[user_id]
+            
+            return file_path
+            
+        except Exception as e:
+            print(f"Error downloading TikTok: {e}")
+            download_progress[user_id]['active'] = False
+            download_progress[user_id]['status_text'] = get_text('error')
+            if user_id in active_downloads:
+                del active_downloads[user_id]
+            return None
+        
+        finally:
+            # Очищаем прогресс через некоторое время
+            await asyncio.sleep(5)
+            download_progress.pop(user_id, None)
+            last_messages.pop(user_id, None)
+    
+    async def update_progress_message(self, user_id: int, update_interval: float = 1.0):
+        """Обновление сообщения с прогрессом"""
+        count = 0
+        while download_progress.get(user_id, {}).get('active', False):
+            try:
+                progress_data = download_progress.get(user_id, {})
+                message = progress_data.get('message')
+                
+                count += 1
+                print(f"Update #{count} for user {user_id}: {progress_data.get('percentage', 0):.1f}%")
+                
+                # Обновляем сообщение даже если total=0, чтобы показать статус
+                if message:
+                    # Создаем красивое сообщение с прогрессом
+                    if progress_data.get('total', 0) > 0:
+                        progress_bar = create_progress_bar(
+                            progress_data.get('downloaded', 0), 
+                            progress_data.get('total', 0)
+                        )
+                        
+                        speed = progress_data.get('speed', 0)
+                        speed_text = f"{speed/1024/1024:.1f} MB/s" if speed > 0 else "Вычисление..."
+                        
+                        status_text = progress_data.get('status_text', "Скачивание...")
+                        
+                        # Дополнительная информация для премиум
+                        premium_info = ""
+                        if self.is_premium:
+                            elapsed_time = time.time() - progress_data.get('start_time', time.time())
+                            eta = (progress_data.get('total', 0) - progress_data.get('downloaded', 0)) / speed if speed > 0 else 0
+                            premium_info = f"""
+⏱️ Время: {elapsed_time:.1f}s
+⏳ Осталось: {eta:.1f}s
+👑 Премиум режим
+                            """.strip()
+                        
+                        text = f"""
+📥 **Скачивание видео** {'👑' if self.is_premium else ''}
+━━━━━━━━━━━━━━━━━━
+{progress_bar}
+📊 {progress_data.get('percentage', 0):.1f}%
+⚡ Скорость: {speed_text}
+📦 Скачано: {progress_data.get('downloaded', 0)/1024/1024:.1f} MB
+📏 Всего: {progress_data.get('total', 0)/1024/1024:.1f} MB
+{status_text}
+{premium_info}
+                        """.strip()
+                    else:
+                        # Показываем статус даже без прогресса
+                        speed = progress_data.get('speed', 0)
+                        speed_text = f"{speed/1024/1024:.1f} MB/s" if speed > 0 else "Вычисление..."
+                        status_text = progress_data.get('status_text', "🔍 Поиск видео...")
+                        
+                        text = f"""
+📥 **Скачивание видео** {'👑' if self.is_premium else ''}
+━━━━━━━━━━━━━━━━━━
+░░░░░░░░░░░░░░░░░░░░ 0%
+📊 Вычисление...
+⚡ Скорость: {speed_text}
+📦 Скачано: 0.0 MB
+📏 Всего: 0.0 MB
+{status_text}{' 👑' if self.is_premium else ''}
+                        """.strip()
+                    
+                    try:
+                        # Проверяем не изменилось ли сообщение
+                        current_message = text
+                        last_message = last_messages.get(user_id, "")
+                        
+                        if current_message != last_message:
+                            await message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+                            last_messages[user_id] = current_message
+                            print(f"Message updated successfully for user {user_id}")
+                        else:
+                            print(f"Message unchanged for user {user_id}, skipping update")
+                    except Exception as e:
+                        print(f"Failed to update message: {e}")
+                        pass  # Сообщение могло быть удалено
+                else:
+                    print(f"No message for user {user_id}")
+                
+                await asyncio.sleep(update_interval)  # Динамическое обновление
+                
+            except Exception as e:
+                print(f"Error updating progress: {e}")
+                break
 
+tiktok_downloader = TikTokDownloader()
 
-def save_premium(users: set[int]) -> None:
-    """Persist premium user IDs to JSON file."""
-    PREMIUM_FILE.write_text(json.dumps(list(users)))
-
-
-premium_users: set[int] = load_premium()
-
-# ---------------------------------------------------------------------------
-# Active downloads registry  {user_id: asyncio.Task}
-# ---------------------------------------------------------------------------
-active_tasks: dict[int, asyncio.Task] = {}
-
-# ---------------------------------------------------------------------------
-# FSM States
-# ---------------------------------------------------------------------------
-
-class DownloadStates(StatesGroup):
-    choosing_options = State()
-    downloading = State()
-
-
-# ---------------------------------------------------------------------------
-# Keyboards
-# ---------------------------------------------------------------------------
-
-def premium_options_keyboard(quality: str = "best", audio: str = "sound") -> InlineKeyboardMarkup:
-    """Inline keyboard for premium users to pick quality and audio."""
-    quality_buttons = [
-        InlineKeyboardButton(
-            text=("✅ " if quality == "best" else "") + "Best",
-            callback_data="q_best",
-        ),
-        InlineKeyboardButton(
-            text=("✅ " if quality == "medium" else "") + "Medium",
-            callback_data="q_medium",
-        ),
-        InlineKeyboardButton(
-            text=("✅ " if quality == "low" else "") + "Low",
-            callback_data="q_low",
-        ),
-    ]
-    audio_buttons = [
-        InlineKeyboardButton(
-            text=("✅ " if audio == "sound" else "") + "🔊 With sound",
-            callback_data="a_sound",
-        ),
-        InlineKeyboardButton(
-            text=("✅ " if audio == "silent" else "") + "🔇 Silent",
-            callback_data="a_silent",
-        ),
-    ]
-    confirm_button = InlineKeyboardButton(text="⬇️ Download", callback_data="confirm_download")
-    return InlineKeyboardMarkup(
-        inline_keyboard=[quality_buttons, audio_buttons, [confirm_button]]
-    )
-
-
-def cancel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_download")]]
-    )
-
-
-# ---------------------------------------------------------------------------
-# Router & handlers
-# ---------------------------------------------------------------------------
-router = Router()
-
-
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "👋 <b>TikTok Downloader Bot</b>\n\n"
-        "Send me any TikTok link and I'll download it for you!\n\n"
-        "🔑 Send <code>PREMIUM2026</code> to unlock premium features:\n"
-        "  • Quality selection (Best / Medium / Low)\n"
-        "  • Audio options (With sound / Silent)\n"
-        "  • Detailed download progress (speed, ETA, size)",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("premium"))
-async def cmd_premium_status(message: Message) -> None:
-    uid = message.from_user.id
-    if uid in premium_users:
-        await message.answer("⭐ You already have <b>Premium</b> access!", parse_mode="HTML")
+# Обработка кнопки отмены скачивания
+@dp.message(F.text == get_text('cancel_download'))
+async def button_cancel_download(message: Message):
+    if cancel_download(message.from_user.id):
+        cancel_text = "❌ **Скачивание отменено**\n\nВы можете начать новое скачивание." if LANGUAGE == 'ru' else "❌ **Download Cancelled**\n\nYou can start a new download."
+        await message.answer(cancel_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
     else:
-        await message.answer(
-            "Send the activation code to get Premium access.",
-            parse_mode="HTML",
-        )
+        no_download_text = "ℹ️ **Нет активных скачиваний**\n\nОтправьте ссылку на TikTok видео." if LANGUAGE == 'ru' else "ℹ️ **No Active Downloads**\n\nSend a TikTok video link."
+        await message.answer(no_download_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
 
+# Обработка премиум кнопок
+@dp.message(F.text == get_text('premium'))
+async def button_premium(message: Message):
+    if is_premium_user(message.from_user.id):
+        premium_text = """
+👑 **Премиум статус активирован!**
+━━━━━━━━━━━━━━━━━━
 
-@router.message(F.text == "PREMIUM2026")
-async def activate_premium(message: Message) -> None:
-    uid = message.from_user.id
-    if uid in premium_users:
-        await message.answer("⭐ You already have <b>Premium</b>!", parse_mode="HTML")
-        return
-    premium_users.add(uid)
-    save_premium(premium_users)
-    logger.info("User %d activated premium.", uid)
-    await message.answer(
-        "🎉 <b>Premium activated!</b>\n\n"
-        "You now have access to:\n"
-        "• Quality selection\n"
-        "• Audio options\n"
-        "• Detailed progress info\n\n"
-        "Send a TikTok link to try it out!",
-        parse_mode="HTML",
-    )
+🎉 Ваши преимущества:
+• 📹 4K качество видео
+• ⚡ Обновление прогресса каждые 300мс
+• 🎬 Поддержка плейлистов
+• 📝 Субтитры к видео
+• 🚫 Приоритетная обработка
+• 📊 Расширенная статистика
 
+⚙️ **Настройки:**
+• Макс. качество: 4K (2160p)
+• Скорость обновления: 3x быстрее
+• Дополнительные форматы: .srt, .vtt
 
-@router.message(F.text.regexp(TIKTOK_RE))
-async def handle_tiktok_link(message: Message, state: FSMContext) -> None:
-    """Detect TikTok link and either show premium options or start download."""
-    uid = message.from_user.id
-    url_match = TIKTOK_RE.search(message.text)
-    if not url_match:
-        return
-    url = url_match.group(0)
-
-    # Cancel any existing task for this user
-    if uid in active_tasks and not active_tasks[uid].done():
-        active_tasks[uid].cancel()
-
-    if uid in premium_users:
-        # Store URL and defaults in FSM, show options keyboard
-        await state.set_state(DownloadStates.choosing_options)
-        await state.update_data(url=url, quality="best", audio="sound")
-        await message.answer(
-            "⭐ <b>Premium options</b>\nChoose quality and audio, then press Download:",
-            reply_markup=premium_options_keyboard("best", "sound"),
-            parse_mode="HTML",
-        )
+🎮 **Используйте "⚙️ Премиум настройки"**
+        """.strip()
+        
+        await message.answer(premium_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
     else:
-        # Non-premium: download immediately with defaults
-        status_msg = await message.answer("⏳ Preparing download…", reply_markup=cancel_keyboard())
-        task = asyncio.create_task(
-            download_and_send(
-                bot=message.bot,
-                chat_id=uid,
-                url=url,
-                status_msg_id=status_msg.message_id,
-                quality="best",
-                audio="sound",
-                is_premium=False,
+        premium_text = """
+👑 **Активация Премиум**
+━━━━━━━━━━━━━━━━━━
+
+🔓 **Получите премиум доступ:**
+
+📋 **Что дает премиум:**
+• 📹 4K качество видео (вместо 1080p)
+• ⚡ Ультра-быстрый прогресс-бар (300мс)
+• 🎬 Скачивание плейлистов
+• 📝 Автоматические субтитры
+• 🚫 Приоритет в очереди
+• 📊 Детальная статистика
+
+🔑 **Как активировать:**
+Отправьте секретный код в сообщении:
+
+`PREMIUM2024`
+
+💡 **После активации:**
+Новые кнопки и функции появятся автоматически!
+
+🤫 **Код известен только избранным...**
+        """.strip()
+        
+        await message.answer(premium_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(F.text == "⚙️ Премиум настройки")
+async def button_premium_settings(message: Message):
+    if not is_premium_user(message.from_user.id):
+        await message.answer(
+            "❌ **Доступ запрещен**\n\n"
+            "Эта функция доступна только для премиум пользователей.\n\n"
+            "👑 Активируйте премиум статус!",
+            reply_markup=create_main_keyboard(message.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    settings_text = """
+⚙️ **Премиум настройки**
+━━━━━━━━━━━━━━━━━━
+
+🎬 **Качество видео:** 4K (2160p)
+⚡ **Обновление прогресса:** 300мс
+📝 **Субтитры:** Автоматически
+🚀 **Приоритет:** Высокий
+
+📋 **Доступные форматы:**
+• MP4 (до 4K)
+• SRT (субтитры)
+• VTT (субтитры)
+• WEBP, JPG, PNG
+
+🔧 **Дополнительно:**
+• Поддержка плейлистов
+• Множественные скачивания
+• Расширенная статистика
+
+💎 **Ваш премиум статус активен!**
+    """.strip()
+    
+    await message.answer(settings_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+
+# Обработка секретного кода
+@dp.message(F.text == PREMIUM_SECRET_CODE)
+async def activate_premium_command(message: Message):
+    if is_premium_user(message.from_user.id):
+        await message.answer(
+            "👑 **Премиум уже активирован!**\n\n"
+            "Вы уже используете премиум функции.",
+            reply_markup=create_main_keyboard(message.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    if activate_premium(message.from_user.id):
+        success_text = f"""
+🎉 **Премиум активирован!**
+━━━━━━━━━━━━━━━━━━
+
+👑 Поздравляю, {message.from_user.first_name}!
+
+🚀 **Ваши новые возможности:**
+• 📹 4K качество видео
+• ⚡ Ультра-быстрый прогресс-бар
+• 🎬 Поддержка плейлистов
+• 📝 Автоматические субтитры
+• 🚫 Приоритетная обработка
+• 📊 Расширенная статистика
+
+🎮 **Новые кнопки появились!**
+Проверьте главную меню.
+
+💎 **Наслаждайтесь премиум функциями!**
+        """.strip()
+        
+        await message.answer(success_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+        
+        # Уведомление админа о новой активации
+        if is_admin(ADMIN_ID):
+            await bot.send_message(
+                ADMIN_ID,
+                f"👑 **Новый премиум пользователь!**\n\n"
+                f"👤 {message.from_user.full_name}\n"
+                f"🆔 ID: `{message.from_user.id}`\n"
+                f"🏷️ @{message.from_user.username if message.from_user.username else 'Нет'}",
+                parse_mode=ParseMode.MARKDOWN
             )
-        )
-        active_tasks[uid] = task
-
-
-# ---------------------------------------------------------------------------
-# Premium option callbacks
-# ---------------------------------------------------------------------------
-
-@router.callback_query(DownloadStates.choosing_options, F.data.startswith("q_"))
-async def cb_quality(callback: CallbackQuery, state: FSMContext) -> None:
-    quality = callback.data.split("_", 1)[1]  # best / medium / low
-    data = await state.get_data()
-    await state.update_data(quality=quality)
-    await callback.message.edit_reply_markup(
-        reply_markup=premium_options_keyboard(quality, data.get("audio", "sound"))
-    )
-    await callback.answer()
-
-
-@router.callback_query(DownloadStates.choosing_options, F.data.startswith("a_"))
-async def cb_audio(callback: CallbackQuery, state: FSMContext) -> None:
-    audio = callback.data.split("_", 1)[1]  # sound / silent
-    data = await state.get_data()
-    await state.update_data(audio=audio)
-    await callback.message.edit_reply_markup(
-        reply_markup=premium_options_keyboard(data.get("quality", "best"), audio)
-    )
-    await callback.answer()
-
-
-@router.callback_query(DownloadStates.choosing_options, F.data == "confirm_download")
-async def cb_confirm_download(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    uid = callback.from_user.id
-    url = data.get("url")
-    quality = data.get("quality", "best")
-    audio = data.get("audio", "sound")
-
-    await state.set_state(DownloadStates.downloading)
-    await callback.message.edit_text("⏳ Preparing download…", reply_markup=cancel_keyboard())
-
-    task = asyncio.create_task(
-        download_and_send(
-            bot=callback.bot,
-            chat_id=uid,
-            url=url,
-            status_msg_id=callback.message.message_id,
-            quality=quality,
-            audio=audio,
-            is_premium=True,
-        )
-    )
-    active_tasks[uid] = task
-    await callback.answer()
-
-
-@router.callback_query(F.data == "cancel_download")
-async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    uid = callback.from_user.id
-    task = active_tasks.get(uid)
-    if task and not task.done():
-        task.cancel()
-        logger.info("User %d cancelled download.", uid)
-        await callback.message.edit_text("❌ Download cancelled.")
     else:
-        await callback.message.edit_text("ℹ️ No active download to cancel.")
-    await state.clear()
+        await message.answer(
+            "❌ **Ошибка активации**\n\n"
+            "Попробуйте снова или обратитесь к администратору.",
+            reply_markup=create_main_keyboard(message.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# Админ панель
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде", reply_markup=create_main_keyboard())
+        return
+    
+    await message.answer("🔐 **Админ панель**", reply_markup=create_admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+# Обработка навигационных кнопок
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🏠 **Главное меню**\n\n"
+        "Выберите действие из кнопок ниже или отправьте ссылку на TikTok видео",
+        reply_markup=create_navigation_keyboard(back_button=False),
+        parse_mode=ParseMode.MARKDOWN
+    )
     await callback.answer()
 
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🔐 **Админ панель**", 
+        reply_markup=create_admin_keyboard(), 
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await callback.answer()
 
-# ---------------------------------------------------------------------------
-# Core download coroutine
-# ---------------------------------------------------------------------------
+# Обработка текстовых кнопок
+@dp.message(F.text == "📥 Скачать видео")
+async def button_download(message: Message):
+    await message.answer(
+        "� **Скачивание видео**\n\n"
+        "Отправьте ссылку на TikTok видео в любом формате:\n\n"
+        "• `tiktok.com/@username/video/1234567890`\n"
+        "• `vt.tiktok.com/...`\n"
+        "• `vm.tiktok.com/...`\n"
+        "• `tiktok.com/t/...`\n\n"
+        "🔗 Просто отправьте ссылку и я начну скачивание!",
+        reply_markup=create_navigation_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def download_and_send(
-    bot: Bot,
-    chat_id: int,
-    url: str,
-    status_msg_id: int,
-    quality: str,
-    audio: str,
-    is_premium: bool,
-) -> None:
-    """Download the TikTok video and send it; update progress in real time."""
+@dp.message(F.text == "📊 Статистика")
+async def button_stats(message: Message):
+    if is_admin(message.from_user.id):
+        uptime = datetime.now() - bot_stats['start_time']
+        success_rate = (bot_stats['successful_downloads'] / bot_stats['total_downloads'] * 100) if bot_stats['total_downloads'] > 0 else 0
+        
+        stats_text = f"""
+� **Статистика бота**
+━━━━━━━━━━━━━━━━━━
+🔥 Всего скачиваний: {bot_stats['total_downloads']}
+✅ Успешных: {bot_stats['successful_downloads']}
+❌ Неудачных: {bot_stats['failed_downloads']}
+📈 Успешность: {success_rate:.1f}%
+👥 Пользователей: {bot_stats['users_count']}
+⏰ Время работы: {str(uptime).split('.')[0]}
+🕐 Последнее скачивание: {bot_stats['last_download'].strftime('%H:%M %d.%m.%Y') if bot_stats['last_download'] else 'Нет'}
+        """.strip()
+        
+        await message.answer(stats_text, reply_markup=create_navigation_keyboard(admin_panel=True), parse_mode=ParseMode.MARKDOWN)
+    else:
+        # Общая статистика для пользователей
+        user_stats = f"""
+📊 **Статистика бота**
+━━━━━━━━━━━━━━━━━━
+🔥 Всего скачиваний: {bot_stats['total_downloads']}
+✅ Успешных: {bot_stats['successful_downloads']}
+👥 Активных пользователей: {bot_stats['users_count']}
+⏰ Бот работает: {(datetime.now() - bot_stats['start_time']).days} дней
+        """.strip()
+        
+        await message.answer(user_stats, reply_markup=create_navigation_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
-    tmpdir = tempfile.mkdtemp(prefix="tiktok_")
-    output_path: Optional[Path] = None
-    last_edit_time: float = 0.0
+@dp.message(F.text == "ℹ️ Помощь")
+async def button_help(message: Message):
+    help_text = """
+ℹ️ **Помощь - TikTok Downloader Bot**
+━━━━━━━━━━━━━━━━━━
 
-    # ✅ Capture the running loop HERE, in the async context, before any threads start.
-    loop = asyncio.get_running_loop()
+🔗 **Как использовать:**
+1. Нажмите "� Скачать видео"
+2. Отправьте ссылку на TikTok
+3. Дождитесь скачивания
 
-    async def safe_edit(text: str) -> None:
-        nonlocal last_edit_time
-        now = time.monotonic()
-        if now - last_edit_time < 0.5:
+📋 **Поддерживаемые форматы:**
+• `tiktok.com/@username/video/1234567890`
+• `vt.tiktok.com/...`
+• `vm.tiktok.com/...`
+• `tiktok.com/t/...`
+
+⚠️ **Важно:**
+• Работает только с публичными видео
+• Макс. качество: 1080p
+• Макс. размер: 50MB
+
+🚀 **Быстрый старт:**
+Просто отправьте любую TikTok ссылку!
+
+📞 **Поддержка:**
+Если возникли проблемы - попробуйте другую ссылку.
+    """.strip()
+    
+    await message.answer(help_text, reply_markup=create_navigation_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(F.text == "🆔 Мой ID")
+async def button_id(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or "Нет"
+    
+    id_text = f"""
+🆔 **Ваша информация**
+━━━━━━━━━━━━━━━━━━
+👤 ID: `{user_id}`
+🏷️ Username: @{username}
+📝 Имя: {message.from_user.full_name}
+    """.strip()
+    
+    await message.answer(id_text, reply_markup=create_navigation_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+# Обработка админ колбэков
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+    
+    action = callback.data.split("_")[1]
+    
+    if action == "stats":
+        uptime = datetime.now() - bot_stats['start_time']
+        success_rate = (bot_stats['successful_downloads'] / bot_stats['total_downloads'] * 100) if bot_stats['total_downloads'] > 0 else 0
+        
+        stats_text = f"""
+📊 **Статистика бота**
+━━━━━━━━━━━━━━━━━━
+🔥 Всего скачиваний: {bot_stats['total_downloads']}
+✅ Успешных: {bot_stats['successful_downloads']}
+❌ Неудачных: {bot_stats['failed_downloads']}
+📈 Успешность: {success_rate:.1f}%
+👥 Пользователей: {bot_stats['users_count']}
+⏰ Время работы: {str(uptime).split('.')[0]}
+🕐 Последнее скачивание: {bot_stats['last_download'].strftime('%H:%M %d.%m.%Y') if bot_stats['last_download'] else 'Нет'}
+        """
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+        ])
+        
+        await callback.message.edit_text(stats_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    elif action == "users":
+        users_list = bot_stats.get('users', set())
+        users_text = f"""
+👥 **Пользователи бота**
+━━━━━━━━━━━━━━━━━━
+📊 Всего пользователей: {len(users_list)}
+🚫 Заблокировано: {len(blocked_users)}
+        """
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_users")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+        ])
+        
+        await callback.message.edit_text(users_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    elif action == "block":
+        await callback.message.edit_text(
+            "🚫 **Заблокировать пользователя**\n\n"
+            "Отправьте ID пользователя которого нужно заблокировать\n"
+            "Или переслайте сообщение от этого пользователя",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        # Устанавливаем состояние ожидания ID
+        dp.message_handlers.register(block_user_handler, F.text)
+    
+    elif action == "unblock":
+        if not blocked_users:
+            await callback.message.edit_text("✅ Список заблокированных пользователей пуст", parse_mode=ParseMode.MARKDOWN)
             return
-        last_edit_time = now
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg_id,
-                text=text,
-                reply_markup=cancel_keyboard(),
-            )
-        except Exception:
-            pass
+        
+        users_text = "🚫 **Заблокированные пользователи**\n\n"
+        for user_id in blocked_users:
+            users_text += f"🔹 `{user_id}`\n"
+        
+        users_text += "\nОтправьте ID пользователя для разблокировки"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+        ])
+        
+        await callback.message.edit_text(users_text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+        # Устанавливаем состояние ожидания ID
+        dp.message.handlers.register(unblock_user_handler, F.text)
+    
+    elif action == "broadcast":
+        await callback.message.edit_text(
+            "📢 **Рассылка сообщений**\n\n"
+            "Отправьте текст сообщения для рассылки всем пользователям",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        # Устанавливаем состояние ожидания сообщения
+        dp.message.handlers.register(broadcast_handler, F.text)
+    
+    elif action == "restart":
+        await callback.message.edit_text("🔄 Перезагрузка бота...")
+        # Перезапуск через исключение
+        os._exit(0)
+    
+    elif action == "back":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+            [InlineKeyboardButton(text="🚫 Заблокировать", callback_data="admin_block")],
+            [InlineKeyboardButton(text="✅ Разблокировать", callback_data="admin_unblock")],
+            [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin_settings")],
+            [InlineKeyboardButton(text="🔄 Перезагрузить бота", callback_data="admin_restart")]
+        ])
+        await callback.message.edit_text("🔐 **Админ панель**", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    await callback.answer()
 
-    def progress_hook(d: dict) -> None:
-        """Called by yt-dlp from an executor thread — use the pre-captured loop."""
-        if d.get("status") == "downloading":
-            if is_premium:
-                downloaded = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                speed = d.get("speed") or 0
-                eta = d.get("eta") or 0
-                percent_str = d.get("_percent_str", "?%").strip()
-                speed_str = _fmt_bytes(speed) + "/s" if speed else "—"
-                size_str = f"{_fmt_bytes(downloaded)} / {_fmt_bytes(total)}" if total else _fmt_bytes(downloaded)
-                eta_str = _fmt_time(eta) if eta else "—"
-                text = (
-                    f"⬇️ Downloading…\n"
-                    f"📊 {percent_str}  {size_str}\n"
-                    f"⚡ {speed_str}   ⏱ ETA: {eta_str}"
+# Обработчики для админ функций
+async def block_user_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        user_id = int(message.text)
+        blocked_users.add(user_id)
+        await message.answer(f"✅ Пользователь `{user_id}` заблокирован", parse_mode=ParseMode.MARKDOWN)
+        dp.message.handlers.unregister(block_user_handler)
+    except ValueError:
+        await message.answer("❌ Неверный формат ID пользователя. Введите числовой ID.")
+
+async def unblock_user_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        user_id = int(message.text)
+        if user_id in blocked_users:
+            blocked_users.remove(user_id)
+            await message.answer(f"✅ Пользователь `{user_id}` разблокирован", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.answer(f"❌ Пользователь `{user_id}` не найден в списке заблокированных", parse_mode=ParseMode.MARKDOWN)
+        dp.message.handlers.unregister(unblock_user_handler)
+    except ValueError:
+        await message.answer("❌ Неверный формат ID пользователя. Введите числовой ID.")
+
+async def broadcast_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    text = message.text
+    users = bot_stats.get('users', set())
+    success_count = 0
+    
+    for user_id in users:
+        if user_id not in blocked_users:
+            try:
+                await bot.send_message(user_id, f"📢 **Сообщение от администратора:**\n\n{text}", parse_mode=ParseMode.MARKDOWN)
+                success_count += 1
+                await asyncio.sleep(0.1)  # Задержка чтобы не превысить лимиты
+            except Exception as e:
+                print(f"Failed to send broadcast to {user_id}: {e}")
+    
+    await message.answer(f"✅ Рассылка завершена\n\n📊 Отправлено: {success_count}/{len(users)} пользователей", parse_mode=ParseMode.MARKDOWN)
+    dp.message.handlers.unregister(broadcast_handler)
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    try:
+        is_premium = is_premium_user(message.from_user.id)
+        is_admin_user = is_admin(message.from_user.id)
+        
+        if LANGUAGE == 'ru':
+            welcome_text = f"""
+{get_text('welcome')} {'👑' if is_premium else ''} {'🔧' if is_admin_user else ''}
+━━━━━━━━━━━━━━━━━━
+
+👋 Привет, {message.from_user.first_name}!
+
+{get_text('start_help')}
+
+{get_text('features')}
+• 📥 Скачивать видео в {'4K' if is_premium else 'HD'} качестве
+• 🖼️ Сохранять изображения и фото
+• ⚡ {'Ультра-быстрая' if is_premium else 'Быстрая'} обработка ссылок
+• 📊 {'Ультра-быстрый' if is_premium else 'Красивый'} прогресс-бар
+{'• 🔧 Админ права: безлимитные скачивания' if is_admin_user else ''}
+
+🔗 **Просто отправь ссылку:**
+`tiktok.com/@username/video/1234567890`
+`vt.tiktok.com/...`
+`vm.tiktok.com/...`
+
+{'👑 **Премиум статус активирован!**' if is_premium else ''}
+{'� **Админ права активированы!**' if is_admin_user else ''}
+{'�🔓 **Хотите больше функций? Отправьте `PREMIUM2024`**' if not is_premium and not is_admin_user else ''}
+
+{get_text('channel')}
+
+🎮 **Используй кнопки ниже для навигации!**
+            """.strip()
+        else:
+            welcome_text = f"""
+{get_text('welcome')} {'👑' if is_premium else ''} {'🔧' if is_admin_user else ''}
+━━━━━━━━━━━━━━━━━━
+
+👋 Hello, {message.from_user.first_name}!
+
+{get_text('start_help')}
+
+{get_text('features')}
+• 📥 Download videos in {'4K' if is_premium else 'HD'} quality
+• 🖼️ Save images and photos
+• ⚡ {'Ultra-fast' if is_premium else 'Fast'} link processing
+• 📊 {'Ultra-fast' if is_premium else 'Beautiful'} progress bar
+{'• 🔧 Admin rights: unlimited downloads' if is_admin_user else ''}
+
+🔗 **Just send a link:**
+`tiktok.com/@username/video/1234567890`
+`vt.tiktok.com/...`
+`vm.tiktok.com/...`
+
+{'👑 **Premium status activated!**' if is_premium else ''}
+{'� **Admin rights activated!**' if is_admin_user else ''}
+{'�🔓 **Want more features? Send `PREMIUM2024`**' if not is_premium and not is_admin_user else ''}
+
+{get_text('channel')}
+
+🎮 **Use the buttons below for navigation!**
+            """.strip()
+        
+        await message.answer(welcome_text, reply_markup=create_main_keyboard(message.from_user.id), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        print(f"Error in cmd_start: {e}")
+        # Отправляем упрощенное сообщение без форматирования
+        simple_text = f"Привет, {message.from_user.first_name}! Отправьте ссылку на TikTok видео для скачивания."
+        await message.answer(simple_text, reply_markup=create_main_keyboard(message.from_user.id))
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    try:
+        help_text = """
+ℹ️ **Подощь - TikTok Downloader Bot**
+━━━━━━━━━━━━━━━━━━
+
+🔗 **Как использовать:**
+1. Нажмите "📥 Скачать видео" или отправьте ссылку
+2. Отправьте ссылку на TikTok видео
+3. Наблюдайте за прогресс-баром
+4. Получите готовое видео!
+
+📋 **Поддерживаемые форматы:**
+• `tiktok.com/@username/video/1234567890`
+• `vt.tiktok.com/...` (короткие ссылки)
+• `vm.tiktok.com/...` (мобильные ссылки)
+• `tiktok.com/t/...` (новые ссылки)
+
+⚡ **Возможности:**
+• 🎬 Видео до 1080p качества
+• 🖼️ Изображения и фото
+• 📊 Прогресс скачивания в реальном времени
+• 🚀 Автоматическое определение типа контента
+• 📱 Работает на всех устройствах
+
+⚠️ **Ограничения:**
+• Только публичные видео
+• Макс. размер файла: 50MB
+• Автоматическое удаление временных файлов
+
+🐛 **Проблемы?**
+Если видео не скачивается:
+• Проверьте правильность ссылки
+• Убедитесь что видео доступно
+• Попробуйте другую ссылку
+
+💡 **Совет:**
+Используйте кнопки для быстрой навигации!
+        """.strip()
+        
+        await message.answer(help_text, reply_markup=create_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        print(f"Error in cmd_help: {e}")
+        simple_help = "Отправьте ссылку на TikTok видео для скачивания. Поддерживаются все форматы ссылок."
+        await message.answer(simple_help, reply_markup=create_main_keyboard(message.from_user.id))
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    try:
+        user_id = message.from_user.id
+        username = message.from_user.username or "Нет"
+        
+        id_text = f"""
+🆔 **Ваша информация**
+━━━━━━━━━━━━━━━━━━
+👤 ID: `{user_id}`
+🏷️ Username: @{username}
+📝 Имя: {message.from_user.full_name}
+        """.strip()
+        
+        await message.answer(id_text, reply_markup=create_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        print(f"Error in cmd_id: {e}")
+        simple_id = f"Ваш ID: {message.from_user.id}"
+        await message.answer(simple_id, reply_markup=create_main_keyboard(message.from_user.id))
+
+@dp.message(F.text)
+async def handle_text_message(message: Message):
+    # Проверяем не заблокирован ли пользователь
+    if is_user_blocked(message.from_user.id):
+        return
+    
+    text = message.text
+    
+    # Проверяем секретный код премиум
+    if text == PREMIUM_SECRET_CODE:
+        await activate_premium_command(message)
+        return
+    
+    tiktok_match = TIKTOK_REGEX.search(text)
+    
+    if not tiktok_match:
+        # Если это не ссылка, показываем подсказку
+        if not any(button.text in text for button in create_main_keyboard(message.from_user.id).keyboard[0] + 
+                  create_main_keyboard(message.from_user.id).keyboard[1] +
+                  (create_main_keyboard(message.from_user.id).keyboard[2] if is_premium_user(message.from_user.id) else [])):
+            await message.answer(
+                "🔍 **Не найдено TikTok ссылки**\n\n"
+                "Отправьте ссылку на TikTok видео или используйте кнопки ниже:",
+                reply_markup=create_main_keyboard(message.from_user.id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+    
+    url = tiktok_match.group(0)
+    if not url.startswith('http'):
+        url = 'https://' + url
+    
+    print(f"Найдена TikTok ссылка: {url}")
+    
+    # Создаем начальное сообщение с прогрессом
+    is_premium = is_premium_user(message.from_user.id)
+    progress_text = f"""
+📥 **Скачивание видео** {'👑' if is_premium else ''}
+━━━━━━━━━━━━━━━━━━
+░░░░░░░░░░░░░░░░░░░░ 0%
+📊 0.0%
+⚡ Скорость: Вычисление...
+📦 Скачано: 0.0 MB
+📏 Всего: 0.0 MB
+🔍 Поиск видео{' 👑' if is_premium else ''}...
+    """.strip()
+    
+    processing_msg = await message.answer(progress_text, parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        # Создаем экземпляр TikTokDownloader с премиум настройками
+        downloader = TikTokDownloader(message.from_user.id)
+        
+        # Запускаем скачивание с прогресс-баром
+        file_path = await downloader.download_tiktok(url, message.from_user.id, processing_msg)
+        
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            
+            # Проверяем лимит размера (админ - без лимита, премиум - 100MB, обычные - 50MB)
+            if is_admin(message.from_user.id):
+                max_size = float('inf')  # Без лимита для админа
+                size_info = "без лимита"
+            elif is_premium:
+                max_size = 100 * 1024 * 1024  # 100MB для премиум
+                size_info = "100MB"
+            else:
+                max_size = 50 * 1024 * 1024  # 50MB для обычных
+                size_info = "50MB"
+            
+            if file_size > max_size:
+                size_mb = file_size / 1024 / 1024
+                
+                if is_admin(message.from_user.id):
+                    # Для админа показываем только если файл слишком большой для самого Telegram
+                    telegram_limit = 50 * 1024 * 1024  # Telegram лимит ~50MB
+                    if file_size > telegram_limit:
+                        error_text = f"""
+⚠️ **Файл слишком большой даже для Telegram**
+
+Размер: {size_mb:.1f}МБ
+Лимит Telegram: ~50МБ
+
+Файл будет скачан, но не может быть отправлен через Telegram.
+                        """.strip()
+                        await processing_msg.edit_text(error_text, parse_mode=ParseMode.MARKDOWN)
+                    else:
+                        # Админ может скачать любой файл до лимита Telegram
+                        pass
+                else:
+                    error_text = f"""
+❌ **Ошибка размера файла**
+
+Видео слишком большое для Telegram ({size_mb:.1f}МБ > {size_info})
+{'👑 Премиум пользователи могут скачивать файлы до 100MB' if not is_premium else ''}
+
+Попробуйте другую ссылку или скачайте видео напрямую.
+                    """.strip()
+                    
+                    await processing_msg.edit_text(error_text, parse_mode=ParseMode.MARKDOWN)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    update_stats(False, message.from_user.id)
+                    return
+            
+            # Показываем финальный прогресс
+            final_progress = f"""
+📥 **Скачивание видео** {'👑' if is_premium else ''}
+━━━━━━━━━━━━━━━━━━
+████████████████████ 100%
+📊 100.0%
+⚡ Скорость: Готово!
+📦 Скачано: {file_size/1024/1024:.1f} MB
+📏 Всего: {file_size/1024/1024:.1f} MB
+✅ Скачивание завершено{' 👑' if is_premium else ''}!
+            """.strip()
+            
+            await processing_msg.edit_text(final_progress, parse_mode=ParseMode.MARKDOWN)
+            
+            await asyncio.sleep(1)  # Небольшая пауза
+            
+            await processing_msg.edit_text("📤 **Загрузка в Telegram...**", parse_mode=ParseMode.MARKDOWN)
+            
+            file_extension = Path(file_path).suffix.lower()
+            
+            if file_extension in ['.jpg', '.jpeg', '.png', '.webp']:
+                await bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=types.FSInputFile(file_path),
+                    caption=f"🖼️ **Вот ваше изображение из TikTok!**{' 👑' if is_premium else ''}\n\n"
+                           f"🎉 Скачано успешно! Используйте кнопки для навигации.",
+                    reply_markup=create_main_keyboard(message.from_user.id),
+                    parse_mode=ParseMode.MARKDOWN
                 )
             else:
-                percent_str = d.get("_percent_str", "").strip()
-                text = f"⬇️ Downloading… {percent_str}"
-
-            # ✅ Use the pre-captured loop, not get_event_loop() (which fails in threads)
-            asyncio.run_coroutine_threadsafe(safe_edit(text), loop)
-
-    try:
-        await safe_edit("🔍 Fetching video info…")
-
-        fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
-        ydl_opts: dict = {
-            "format": fmt,
-            "outtmpl": str(Path(tmpdir) / "%(id)s.%(ext)s"),
-            "progress_hooks": [progress_hook],
-            "quiet": True,
-            "no_warnings": True,
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-        }
-
-        if audio == "silent":
-            if quality == "low":
-                ydl_opts["format"] = "bestvideo[height<=360][ext=mp4]/bestvideo"
-            elif quality == "medium":
-                ydl_opts["format"] = "bestvideo[height<=720][ext=mp4]/bestvideo"
-            else:
-                ydl_opts["format"] = "bestvideo[height<=720][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
-
-        info: dict = await loop.run_in_executor(
-            None, lambda: _run_ydl(ydl_opts, url)
-        )
-
-        if info is None:
-            await safe_edit("❌ Could not retrieve video info.")
-            return
-
-        video_id = info.get("id", "")
-        candidates = list(Path(tmpdir).glob(f"{video_id}.*"))
-        if not candidates:
-            candidates = list(Path(tmpdir).glob("*"))
-        if not candidates:
-            await safe_edit("❌ Download failed: file not found.")
-            return
-
-        output_path = candidates[0]
-        file_size = output_path.stat().st_size
-
-        if file_size > 50 * 1024 * 1024:
-            await safe_edit(
-                "❌ File is too large to send via Telegram (>50 MB).\n"
-                "Try a lower quality setting."
-            )
-            return
-
-        await safe_edit("📤 Uploading to Telegram…")
-
-        title = info.get("title", "TikTok video")
-        caption = f"🎬 {title[:900]}" if title else "🎬 TikTok video"
-
-        with output_path.open("rb") as video_file:
-            await bot.send_video(
-                chat_id=chat_id,
-                video=video_file,  # type: ignore[arg-type]
-                caption=caption,
-                supports_streaming=True,
-            )
-
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
-        except Exception:
-            pass
-
-        logger.info("Sent video to user %d (%s)", chat_id, url)
-
-    except asyncio.CancelledError:
-        logger.info("Download task cancelled for user %d.", chat_id)
-        raise
-
-    except yt_dlp.utils.DownloadError as exc:
-        logger.warning("yt-dlp error for user %d: %s", chat_id, exc)
-        msg = str(exc)
-        if "private" in msg.lower():
-            await safe_edit("❌ This video is private and cannot be downloaded.")
-        elif "removed" in msg.lower():
-            await safe_edit("❌ This video has been removed.")
+                await bot.send_video(
+                    chat_id=message.chat.id,
+                    video=types.FSInputFile(file_path),
+                    caption=f"🎬 **Вот ваше видео из TikTok!**{' 👑' if is_premium else ''}\n\n"
+                           f"🎉 Скачано успешно! Используйте кнопки для навигации.",
+                    reply_markup=create_main_keyboard(message.from_user.id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            
+            await processing_msg.delete()
+            
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            
+            # Обновляем статистику
+            update_stats(True, message.from_user.id)
         else:
-            await safe_edit(f"❌ Download error:\n<code>{msg[:200]}</code>")
+            await processing_msg.edit_text(
+                "❌ **Ошибка скачивания**\n\n"
+                "Не удалось скачать видео.\n\n"
+                "**Возможные причины:**\n"
+                "• Видео удалено или недоступно\n"
+                "• Проблемы с доступом к TikTok\n"
+                "• Неправильная ссылка\n\n"
+                "🔄 Попробуйте другую ссылку.",
+                reply_markup=create_main_keyboard(message.from_user.id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Обновляем статистику
+            update_stats(False, message.from_user.id)
+    
+    except Exception as e:
+        print(f"Error in handle_text_message: {e}")
+        await processing_msg.edit_text(
+            "❌ **Критическая ошибка**\n\n"
+            "Произошла ошибка при скачивании видео.\n\n"
+            "🔄 Попробуйте еще раз или другую ссылку.",
+            reply_markup=create_main_keyboard(message.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Обновляем статистику
+        update_stats(False, message.from_user.id)
 
-    except Exception as exc:
-        logger.exception("Unexpected error for user %d: %s", chat_id, exc)
-        await safe_edit(f"❌ Unexpected error: {exc}")
+@dp.message()
+async def handle_other_messages(message: Message):
+    if message.content_type == ContentType.TEXT:
+        return
+    
+    await message.reply(
+        "🤔 **Я понимаю только текстовые сообщения**\n\n"
+        "Отправьте ссылку на TikTok видео или используйте кнопки ниже:",
+        reply_markup=create_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-    finally:
-        _cleanup(tmpdir)
-        active_tasks.pop(chat_id, None)
+async def main():
+    print("🚀 TikTok Bot запускается...")
+    
+    # Оптимизация для GitHub Actions
+    if GITHUB_ACTIONS_MODE:
+        print("🔄 Режим GitHub Actions активирован")
+        print(f"⏰ Максимальное время работы: {MAX_RUNTIME} секунд")
+        
+        # Запускаем таймер для автоматического завершения
+        asyncio.create_task(github_actions_timer())
+    
+    await dp.start_polling(bot)
 
-def _run_ydl(opts: dict, url: str) -> Optional[dict]:
-    """Synchronous yt-dlp extraction; runs in executor thread."""
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=True)
-
-
-def _cleanup(tmpdir: str) -> None:
-    """Delete temp directory and its contents."""
-    try:
-        for f in Path(tmpdir).iterdir():
-            f.unlink(missing_ok=True)
-        Path(tmpdir).rmdir()
-    except Exception as exc:
-        logger.warning("Cleanup failed: %s", exc)
-
-
-def _fmt_bytes(n: float) -> str:
-    """Human-readable byte size."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-
-def _fmt_time(seconds: int) -> str:
-    """Format seconds as mm:ss or hh:mm:ss."""
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main() -> None:
-    bot = Bot(token=BOT_TOKEN)
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
-    dp.include_router(router)
-
-    logger.info("Bot starting (long polling)…")
-    try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-    finally:
-        logger.info("Bot stopped.")
-        await bot.session.close()
-
+async def github_actions_timer():
+    """Таймер для автоматического завершения в GitHub Actions"""
+    await asyncio.sleep(MAX_RUNTIME)
+    print("⏰ Время работы истекло, завершаем...")
+    os._exit(0)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("👋 Бот остановлен")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        os._exit(1)
